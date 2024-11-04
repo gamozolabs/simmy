@@ -9,6 +9,8 @@ const ONE_NEXT_DOWN: Float = (1. as Float).next_down();
 
 /// A triangle in CCW orientation with vertexes starting from the bottom right
 /// corner in our XY plane.
+///
+/// This also holds the `usize` of the `Surface.data` that contains the vertex.
 struct Triangle([(DVec3, usize); 3]);
 
 impl Triangle {
@@ -18,7 +20,7 @@ impl Triangle {
         let normal = (self.0[1].0 - self.0[0].0)
             .cross(self.0[2].0 - self.0[0].0);
 
-        // Compute offset of the plane
+        // Compute offset of the plane by substituting a point in the formula
         let offset = normal.x * self.0[0].0.x + normal.y * self.0[0].0.y +
             normal.z * self.0[0].0.z;
 
@@ -55,21 +57,15 @@ impl Plane {
 ///   |     |
 ///   +-----+ width (x, xres)
 /// (0,0)
-struct Surface {
+pub struct Surface {
     /// Raw data, indexed by y * xres + x
     data: Vec<Float>,
 
-    /// Width (x axis)
-    width: Float,
+    /// Width and height, both are > 0. (x and y axis lengths)
+    wh: DVec2,
 
-    /// Height (y axis)
-    height: Float,
-
-    /// Internal X resolution
-    xres: usize,
-
-    /// Internal Y resolution
-    yres: usize,
+    /// Internal X and Y resolution, both are > 0
+    res: (usize, usize),
 
     /// Internal mesh used during rendering. Used just to prevent reallocs of
     /// backing buffers
@@ -78,37 +74,50 @@ struct Surface {
 
 impl Surface {
     /// Create a new surface
-    fn new(width: Float, height: Float, xres: usize, yres: usize) -> Self {
+    pub fn new(width: Float, height: Float, xres: usize, yres: usize) -> Self {
+        // Make sure dimensions are sane
+        assert!(width > 0. && height > 0. && xres > 0 && yres > 0,
+            "Invalid surface dimensions");
+
         Self {
             data: vec![0.; xres.strict_mul(yres)],
+            wh:   DVec2::new(width, height),
+            res:  (xres, yres),
             mesh: Mesh {
                 vertices: Vec::new(),
                 indices:  Vec::new(),
                 texture:  None,
             },
-            width, height, xres, yres,
         }
     }
 
-    /// Gets the point at a given internal coordinate
+    /// Gets the point at a given integer internal coordinate
     ///
     /// Returns the 3d point as well as the index into data that holds the Z
     /// information
     fn get_int(&self, x: usize, y: usize) -> (DVec3, usize) {
         // Fetch the data point
-        let idx = y * self.xres + x;
+        let idx = y.strict_mul(self.res.0).strict_add(x);
         let z = self.data[idx];
 
-        // Get the location of the internal point
-        let xy = self.to_point(x as Float, y as Float);
+        // Get the true coordinates of the internal point
+        let xy = self.to_point(DVec2::new(x as Float, y as Float));
 
         (DVec3::new(xy.x, xy.y, z), idx)
     }
 
     /// Take an internal point and compute the actual point for it
-    fn to_point(&self, x: Float, y: Float) -> DVec2 {
-        let x = x / self.xres.strict_sub(1) as Float * self.width;
-        let y = y / self.yres.strict_sub(1) as Float * self.height;
+    fn to_point(&self, pt: DVec2) -> DVec2 {
+        // Compute the resolution -1
+        let xres = self.res.0.strict_sub(1);
+        let yres = self.res.1.strict_sub(1);
+
+        // Ensure the requested point is in bounds of the surface
+        assert!(pt.x >= 0. && pt.y >= 0. &&
+            pt.x <= xres as Float && pt.y <= yres as Float);
+
+        let x = pt.x / xres as Float * self.wh.x;
+        let y = pt.y / yres as Float * self.wh.y;
         DVec2::new(x, y)
     }
 
@@ -116,19 +125,19 @@ impl Surface {
     fn to_int_point(&self, pt: DVec2) -> DVec2 {
         // Ensure the requested point is in bounds of the surface
         assert!(pt.x >= 0. && pt.y >= 0. &&
-            pt.x <= self.width && pt.y <= self.height);
+            pt.x <= self.wh.x && pt.y <= self.wh.y);
 
         // Compute normalized coords [0, 1)
         let pt_norm = DVec2::new(
-            (pt.x / self.width).min(ONE_NEXT_DOWN),
-            (pt.y / self.height).min(ONE_NEXT_DOWN),
+            (pt.x / self.wh.x).min(ONE_NEXT_DOWN),
+            (pt.y / self.wh.y).min(ONE_NEXT_DOWN),
         );
 
         // Compute zero-indexed internal coordinate based on the resolution of
         // the surface
         let pt_int = DVec2::new(
-            pt_norm.x * self.xres.strict_sub(1) as Float,
-            pt_norm.y * self.yres.strict_sub(1) as Float,
+            pt_norm.x * self.res.0.strict_sub(1) as Float,
+            pt_norm.y * self.res.1.strict_sub(1) as Float,
         );
 
         pt_int
@@ -153,12 +162,6 @@ impl Surface {
         let top_right    = self.get_int(right, top);
         let bottom_left  = self.get_int(left,  bottom);
         let bottom_right = self.get_int(right, bottom);
-
-        // We know that the bottom left and top right will always be used in
-        // every triangle. Now we need to determine if the point is closer to
-        // the top left or the bottom right.
-        let dist_tl = pt.distance(top_left.0.xy());
-        let dist_br = pt.distance(bottom_right.0.xy());
 
         // Determine the triangle the point falls in
         //
@@ -185,6 +188,9 @@ impl Surface {
         // Compute all points which could potentially be the highest points
         // under a given range.
         for range in ranges {
+            assert!(range.0.x < range.1.x);
+            assert!(range.0.y < range.1.y);
+
             let bottom_left_int = self.to_int_point(range.0);
             let top_right_int   = self.to_int_point(range.1);
 
@@ -219,14 +225,14 @@ impl Surface {
 
             for x in left_int..=right_int {
                 // Intersections between the top and bottom edges and the grid
-                let point = self.to_point(x as Float, 0.);
+                let point = self.to_point(DVec2::new(x as Float, 0.));
                 points.push(self.get(DVec2::new(point.x, bottom)));
                 points.push(self.get(DVec2::new(point.x, top)));
             }
 
             for y in bottom_int..=top_int {
                 // Intersections between the left and right edges and the grid
-                let point = self.to_point(0., y as Float);
+                let point = self.to_point(DVec2::new(0., y as Float));
                 points.push(self.get(DVec2::new(left,  point.y)));
                 points.push(self.get(DVec2::new(right, point.y)));
             }
@@ -234,8 +240,10 @@ impl Surface {
             for x in left_int.saturating_sub(1)..=right_int {
                 // Intersections between the top and bottom edges and the
                 // triangle hypotenuses
-                let pointb = self.to_point(x as Float + bottom_int_fract, 0.);
-                let pointt = self.to_point(x as Float + top_int_fract,    0.);
+                let pointb = self.to_point(
+                    DVec2::new(x as Float + bottom_int_fract, 0.));
+                let pointt = self.to_point(
+                    DVec2::new(x as Float + top_int_fract, 0.));
 
                 if pointb.x > left && pointb.x < right {
                     points.push(self.get(DVec2::new(pointb.x, bottom)));
@@ -249,8 +257,10 @@ impl Surface {
             for y in bottom_int.saturating_sub(1)..=top_int {
                 // Intersections between the left and right edges and the
                 // triangle hypotenuses
-                let pointl = self.to_point(0., y as Float + left_int_fract);
-                let pointr = self.to_point(0., y as Float + right_int_fract);
+                let pointl = self.to_point(
+                    DVec2::new(0., y as Float + left_int_fract));
+                let pointr = self.to_point(
+                    DVec2::new(0., y as Float + right_int_fract));
 
                 if pointl.y > bottom && pointl.y < top {
                     points.push(self.get(DVec2::new(left, pointl.y)));
@@ -265,7 +275,7 @@ impl Surface {
             for y in bottom_int..=top_int {
                 for x in left_int..=right_int {
                     points.push(self.get(
-                        self.to_point(x as Float, y as Float)));
+                        self.to_point(DVec2::new(x as Float, y as Float))));
                 }
             }
         }
@@ -315,7 +325,7 @@ impl Surface {
                     let point = best_plane.get(DVec2::new($x, $y));
                     self.mesh.vertices.push(Vertex::new(
                         point.x as f32, point.y as f32, point.z as f32,
-                        0., 0., Color::new(1., 0., 0., 0.5)));
+                        0., 0., RED));
                 }
             }
 
@@ -326,10 +336,6 @@ impl Surface {
             push_vert!(left,  bottom);
             push_vert!(right, bottom);
             push_vert!(right, top);
-
-            for _ in 0..6 {
-                self.mesh.indices.push(self.mesh.indices.len() as u16);
-            }
         }
 
         // For debugging, render all points considered in the hatting
@@ -343,12 +349,12 @@ impl Surface {
         }
 
         // Render the hat
-        draw_mesh(&self.mesh);
+        self.draw_int();
     }
 
     /// Get the height of the surface at a given point via interpolation of the
     /// triangles
-    fn get(&self, pt: DVec2) -> DVec3 {
+    pub fn get(&self, pt: DVec2) -> DVec3 {
         self.get_triangle(pt).plane().get(pt)
     }
 
@@ -356,7 +362,7 @@ impl Surface {
     ///
     /// This raises the entire triangle containing the point to the target Z
     /// value
-    fn set(&mut self, pt: DVec3) {
+    pub fn set(&mut self, pt: DVec3) {
         // Get the triangle containing `pt`
         let triangle = self.get_triangle(pt.xy());
 
@@ -366,11 +372,50 @@ impl Surface {
         }
     }
 
+    /// Render the internal cached mesh
+    ///
+    /// This assumes the internal mesh is just a list of CCW triangles.
+    /// Internally we'll generate `[0..num_verts]` for indices, and compute
+    /// normals for the shading of the triangles.
+    fn draw_int(&mut self) {
+        // Convenience bindings
+        let vertices = &mut self.mesh.vertices;
+        let indices  = &mut self.mesh.indices;
+
+        // Generate indices
+        indices.resize(vertices.len(), 0);
+        indices.iter_mut().enumerate().for_each(|(ii, x)| *x = ii as u16);
+
+        // Compute the normals to update the colors
+        for triangle in self.mesh.vertices.chunks_mut(3) {
+            // Compute the normal
+            let normal = (triangle[1].position - triangle[0].position)
+                .cross(triangle[2].position - triangle[0].position)
+                .normalize();
+
+            // Rotate the normal a bit for better lighting contrast
+            let normal = Mat3::from_rotation_y(0.2) *
+                Mat3::from_rotation_x(0.2) * normal;
+
+            // Compute the shading based on the normal
+            let color = Vec4::new(normal.z, normal.z, normal.z, 1.);
+
+            // Update the colors with the shading of the normal
+            for vertex in triangle {
+                vertex.color = Color::from_vec(Color::from_rgba(
+                    vertex.color[0], vertex.color[1], vertex.color[2],
+                    vertex.color[3]).to_vec() * color).into();
+            }
+        }
+
+        // Render the mesh!
+        draw_mesh(&self.mesh);
+    }
+
     /// Issue render commands for the surface
-    fn draw(&mut self) {
+    pub fn draw(&mut self) {
         // Clear the mesh
         self.mesh.vertices.clear();
-        self.mesh.indices.clear();
 
         // Internal grid layout:
         //
@@ -381,79 +426,32 @@ impl Surface {
         //   |/  |/  |
         //   +---+---+
         // (0,0)      +x
-        for y in 0..self.yres.strict_sub(1) {
-            for x in 0..self.xres.strict_sub(1) {
-                // Convenience bindings
-                let vertices = &mut self.mesh.vertices;
-                let indices  = &mut self.mesh.indices;
-
-                // Save off the number of vertices
-                let num_vert = vertices.len();
-
+        for y in 0..self.res.1.strict_sub(1) {
+            for x in 0..self.res.0.strict_sub(1) {
                 for vertex in [
-                    (0, 0), (1, 1), (0, 1), // Triangle 1
-                    (0, 0), (1, 0), (1, 1), // Triangle 2
+                    (0, 0), (1, 1), (0, 1), // Top left triangle
+                    (0, 0), (1, 0), (1, 1), // Bottom right triangle
                 ] {
                     // Compute vertex coords
-                    let x = x + vertex.0;
-                    let y = y + vertex.1;
+                    let point = self.get_int(x + vertex.0, y + vertex.1).0;
 
-                    // Compute height map index
-                    let idx = y * self.xres + x;
-
-                    // Get height map data
-                    let z = self.data[idx];
-
-                    // Compute scaled X and Y
-                    let x = x as Float / self.xres.strict_sub(1) as Float *
-                        self.width;
-                    let y = y as Float / self.yres.strict_sub(1) as Float *
-                        self.height;
-
-                    // Record the vertex. No color needed we'll compute it with
-                    // the normal afterwards
-                    vertices.push(Vertex::new(
-                        x as f32, y as f32, z as f32, 0., 0., BLACK));
-                }
-
-                // Compute the normals to update the colors
-                for triangle in 0..2 {
-                    // Get the coords
-                    let p0 = vertices[num_vert + triangle * 3 + 0].position;
-                    let p1 = vertices[num_vert + triangle * 3 + 1].position;
-                    let p2 = vertices[num_vert + triangle * 3 + 2].position;
-
-                    let normal = (p1 - p0).cross(p2 - p0).normalize();
-
-                    // Rotate the normal a bit for better lighting contrast
-                    let normal = Mat3::from_rotation_y(0.2) *
-                        Mat3::from_rotation_x(0.2) * normal;
-
-                    let color = Color::new(0., 0., normal.z, 1.);
-
-                    // Update the colors
-                    vertices[num_vert + triangle * 3 + 0].color = color.into();
-                    vertices[num_vert + triangle * 3 + 1].color = color.into();
-                    vertices[num_vert + triangle * 3 + 2].color = color.into();
-                }
-
-                // Record the vertices to use to create triangles
-                for ii in 0..6 {
-                    indices.push((num_vert + ii) as u16);
+                    // Record the vertex in the mesh
+                    self.mesh.vertices.push(Vertex::new(
+                        point.x as f32, point.y as f32, point.z as f32,
+                        0., 0., BLUE));
                 }
 
                 // Perform a draw call when we've accumulated enough data
-                if vertices.len() >= 4096 {
-                    draw_mesh(&self.mesh);
+                if self.mesh.vertices.len() >= 4096 {
+                    self.draw_int();
                     self.mesh.vertices.clear();
-                    self.mesh.indices.clear();
                 }
             }
         }
 
         // Flush remaining data if there is any
         if self.mesh.vertices.len() > 0 {
-            draw_mesh(&self.mesh);
+            self.draw_int();
         }
     }
 }
@@ -486,7 +484,7 @@ async fn main() {
         clear_background(DARKGRAY);
 
         set_camera(&Camera3D {
-            position: vec3(0.5, -0.5, 0.8),
+            position: vec3(0.5, -0.5, 1.3),
             up: vec3(0., 0., 1.),
             target: vec3(0.5, 0.5, 0.),
             ..Default::default()
@@ -507,9 +505,10 @@ async fn main() {
 
         surface.hat(&[
             (DVec2::new(0.47, 0.45), DVec2::new(0.80, 0.84)),
+            (DVec2::new(0.07, 0.10), DVec2::new(0.72, 0.14)),
         ]);
 
-        draw_sphere(surface.get(pt.xy()).as_vec3(), 0.01, None, GREEN);
+        //draw_sphere(surface.get(pt.xy()).as_vec3(), 0.01, None, GREEN);
 
         rad += 0.005;
         next_frame().await
