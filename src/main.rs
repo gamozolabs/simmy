@@ -7,10 +7,15 @@ type Float = f64;
 /// The nearest representable value < 1.0
 const ONE_NEXT_DOWN: Float = (1. as Float).next_down();
 
+/// Visual Z scale. Z is multiplied by this for rendering to amplify surface
+/// roughness. Only used for visuals.
+const Z_SCALE: f32 = 100.;
+
 /// A triangle in CCW orientation with vertexes starting from the bottom right
 /// corner in our XY plane.
 ///
 /// This also holds the `usize` of the `Surface.data` that contains the vertex.
+#[derive(Clone, Default)]
 struct Triangle([(DVec3, usize); 3]);
 
 impl Triangle {
@@ -46,6 +51,15 @@ impl Plane {
 
         DVec3::new(xy.x, xy.y, z)
     }
+}
+
+/// A hat that sits on top of a surface by 3 contact points
+pub struct Hat {
+    /// The infinite plane that represents the hat
+    plane: Plane,
+
+    /// The three points that support the plane
+    contact: [DVec3; 3],
 }
 
 /// A 2-dimensional surface map of a rectangular surface
@@ -182,7 +196,7 @@ impl Surface {
     // Compute a hat for a set of ranges
     //
     // Ranges are (bottom left, top right)
-    fn hat(&mut self, ranges: &[(DVec2, DVec2)]) {
+    fn hat(&mut self, ranges: &[(DVec2, DVec2)], draw: bool) -> Hat {
         let mut points = Vec::new();
 
         // Compute all points which could potentially be the highest points
@@ -304,7 +318,8 @@ impl Surface {
                     }
 
                     if cum_distance < best_plane.0 {
-                        best_plane = (cum_distance, Some(plane));
+                        best_plane = (cum_distance,
+                            Some(([va, vb, vc], plane)));
                     }
                 }
             }
@@ -312,44 +327,53 @@ impl Surface {
 
         let best_plane = best_plane.1.unwrap();
 
-        self.mesh.vertices.clear();
-        self.mesh.indices.clear();
-        for range in ranges {
-            let left   = range.0.x;
-            let right  = range.1.x;
-            let bottom = range.0.y;
-            let top    = range.1.y;
+        if draw {
+            self.mesh.vertices.clear();
+            self.mesh.indices.clear();
+            for range in ranges {
+                let left   = range.0.x;
+                let right  = range.1.x;
+                let bottom = range.0.y;
+                let top    = range.1.y;
 
-            macro_rules! push_vert {
-                ($x:expr, $y:expr) => {
-                    let point = best_plane.get(DVec2::new($x, $y));
-                    self.mesh.vertices.push(Vertex::new(
-                        point.x as f32, point.y as f32, point.z as f32,
-                        0., 0., RED));
+                macro_rules! push_vert {
+                    ($x:expr, $y:expr) => {
+                        let point = best_plane.1.get(DVec2::new($x, $y));
+                        self.mesh.vertices.push(Vertex::new(
+                            point.x as f32, point.y as f32, point.z as f32,
+                            0., 0., RED));
+                    }
+                }
+
+                push_vert!(left,  bottom);
+                push_vert!(right, top);
+                push_vert!(left,  top);
+
+                push_vert!(left,  bottom);
+                push_vert!(right, bottom);
+                push_vert!(right, top);
+            }
+
+            // For debugging, render all points considered in the hatting
+            for point in points {
+                let dist = best_plane.1.get(point.xy()).z - point.z;
+                if dist.abs() < 0.000001 {
+                    draw_sphere(point.as_vec3() * Vec3::new(1., 1., Z_SCALE),
+                        0.02, None, PINK);
+                } else {
+                    draw_sphere(point.as_vec3() * Vec3::new(1., 1., Z_SCALE),
+                        0.005, None, ORANGE);
                 }
             }
 
-            push_vert!(left,  bottom);
-            push_vert!(right, top);
-            push_vert!(left,  top);
-
-            push_vert!(left,  bottom);
-            push_vert!(right, bottom);
-            push_vert!(right, top);
+            // Render the hat
+            self.draw_int();
         }
 
-        // For debugging, render all points considered in the hatting
-        for point in points {
-            let dist = best_plane.get(point.xy()).z - point.z;
-            if dist.abs() < 0.000001 {
-                draw_sphere(point.as_vec3(), 0.02, None, PINK);
-            } else {
-                draw_sphere(point.as_vec3(), 0.005, None, ORANGE);
-            }
+        Hat {
+            contact: best_plane.0,
+            plane:   best_plane.1,
         }
-
-        // Render the hat
-        self.draw_int();
     }
 
     /// Get the height of the surface at a given point via interpolation of the
@@ -388,6 +412,11 @@ impl Surface {
 
         // Compute the normals to update the colors
         for triangle in self.mesh.vertices.chunks_mut(3) {
+            // Scale Z to amplify the surface
+            for vertex in &mut *triangle {
+                vertex.position.z *= Z_SCALE;
+            }
+
             // Compute the normal
             let normal = (triangle[1].position - triangle[0].position)
                 .cross(triangle[2].position - triangle[0].position)
@@ -474,44 +503,97 @@ fn window_conf() -> Conf {
 
 #[macroquad::main(window_conf)]
 async fn main() {
-    let mut surface = Surface::new(1., 1., 8, 16);
+    let mut surface = Surface::new(1247., 215.9, 128, 32);
+
+    for point in surface.data.iter_mut() {
+        *point = rand::gen_range(0., 0.1);
+    }
 
     rand::srand(7175);
 
-    let mut rad: Float = 0.0;
+    let mut best = std::f64::MAX;
+    let mut best_surface = surface.data.clone();
 
     for _frame in 0u64.. {
-        clear_background(DARKGRAY);
+        surface.data.copy_from_slice(&best_surface);
 
-        set_camera(&Camera3D {
-            position: vec3(0.5, -0.5, 1.3),
-            up: vec3(0., 0., 1.),
-            target: vec3(0.5, 0.5, 0.),
-            ..Default::default()
-        });
+        for _ in 0..100 {
+            let sl = surface.data.len();
+            surface.data[::rand::random::<usize>() % sl] = rand::gen_range(0., 0.1);
+        }
 
-        if _frame % 60 == 0 {
-            for point in surface.data.iter_mut() {
-                *point = rand::gen_range(-0.05, 0.05);
+        let ranges = &[
+            (DVec2::new(0., 0.), DVec2::new(50., 50.)),
+            (DVec2::new(0., 190.5), DVec2::new(50., 190.5 + 25.)),
+        ];
+        let hat = surface.hat(ranges, false);
+
+        let desired = 3.;
+
+        // Randomly mutate the hat to reduce error
+        let mut hatmin = std::f64::MAX;
+        let mut besttri = Triangle([
+            (hat.contact[0], 0), (hat.contact[1], 0), (hat.contact[2], 0)
+        ]);
+        for _ in 0..32 {
+            let mut triangle = besttri.clone();
+
+            for (vertex, _) in &mut triangle.0 {
+                vertex.z = rand::gen_range(0.0, 0.1);
+            }
+
+            let plane = triangle.plane();
+
+            // Compute the level reading for the hat
+            let mm_per_m = DVec2::from_angle(-std::f64::consts::PI / 2.).rotate(plane.normal.xz());
+            let mm_per_m = mm_per_m.y / (mm_per_m.x / 1000.);
+            let bubblex  = mm_per_m / 0.050;
+
+            let mm_per_m = DVec2::from_angle(-std::f64::consts::PI / 2.).rotate(plane.normal.yz());
+            let mm_per_m = mm_per_m.y / (mm_per_m.x / 1000.);
+            let bubbley  = mm_per_m / 0.050;
+
+            let err = ((desired - bubblex) * (desired - bubblex)).sqrt();
+            let err = err + ((desired - bubbley) * (desired - bubbley)).sqrt();
+            if err < hatmin {
+                hatmin = err;
+                besttri = triangle.clone();
             }
         }
 
-        let pt = DVec2::from_angle(rad) / 3. + DVec2::new(rad.sin() / 10. + 0.5, rad.sin() / 10. + 0.5);
-        let mut pt = surface.get(pt);
-        pt.z = (rad * 4.).sin() / 20.;
-        //surface.set(pt);
+        // Flush the triangle
+        for (vertex, _) in besttri.0 {
+            surface.set(vertex);
+        }
 
-        surface.draw();
+        let hat = surface.hat(ranges, false);
+        let mm_per_m = DVec2::from_angle(-std::f64::consts::PI / 2.).rotate(hat.plane.normal.xz());
+        let mm_per_m = mm_per_m.y / (mm_per_m.x / 1000.);
+        let bubble   = mm_per_m / 0.050;
+        let err = ((desired - bubble) * (desired - bubble)).sqrt();
 
-        surface.hat(&[
-            (DVec2::new(0.47, 0.45), DVec2::new(0.80, 0.84)),
-            (DVec2::new(0.07, 0.10), DVec2::new(0.72, 0.14)),
-        ]);
+        if err < best {
+            best_surface.copy_from_slice(&surface.data);
+            best = err;
+        }
 
-        //draw_sphere(surface.get(pt.xy()).as_vec3(), 0.01, None, GREEN);
+        if _frame % 10 == 0 {
+            clear_background(DARKGRAY);
 
-        rad += 0.005;
-        next_frame().await
+            set_camera(&Camera3D {
+                position: vec3(surface.wh.x as f32 / 2., -700., 700.),
+                up: vec3(0., 0., 1.),
+                target: vec3(surface.wh.x as f32 / 2., surface.wh.y as f32 / 2., 0.),
+                ..Default::default()
+            });
+
+            surface.data.copy_from_slice(&best_surface);
+
+            println!("{best}");
+            surface.draw();
+            surface.hat(ranges, true);
+            next_frame().await
+        }
     }
 }
 
